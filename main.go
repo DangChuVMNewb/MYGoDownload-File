@@ -5,9 +5,11 @@ import (
     "fmt"
     "io"
     "net/http"
+    "net/url"
     "os"
     "path/filepath"
     "strconv"
+    "strings"
     "sync"
     "sync/atomic"
     "time"
@@ -20,6 +22,8 @@ var (
     downloaded    int64
     printMu       sync.Mutex
     terminalWidth int
+    scrollOffset  int
+    lastScroll    time.Time
 )
 
 func main() {
@@ -32,20 +36,27 @@ func main() {
     if err == nil && width > 0 {
         terminalWidth = width
     } else {
-        terminalWidth = 80 // Mặc định nếu không lấy được
+        terminalWidth = 80
     }
 
     var filename string
-    var url string
+    var urlStr string
 
     if flag.NArg() == 1 {
-        url = flag.Arg(0)
-        filename = filepath.Base(url)
+        urlStr = flag.Arg(0)
+        filename = filepath.Base(urlStr)
     } else if flag.NArg() >= 2 {
         filename = flag.Arg(0)
-        url = flag.Arg(1)
+        urlStr = flag.Arg(1)
     } else {
         fmt.Println("Usage: dow [-c] [-th N] <filepath> <URL>")
+        return
+    }
+
+    // Kiểm tra URL hợp lệ
+    _, err = url.ParseRequestURI(urlStr)
+    if err != nil {
+        fmt.Printf("Error: Invalid URL - %v\n", err)
         return
     }
 
@@ -62,37 +73,56 @@ func main() {
         if err == nil {
             file, err = os.OpenFile(filename, os.O_RDWR, 0644)
             if err != nil {
-                panic(err)
+                fmt.Printf("Error: Cannot open file - %v\n", err)
+                return
             }
             currentSize = fileInfo.Size()
         } else {
             file, err = os.Create(filename)
             if err != nil {
-                panic(err)
+                fmt.Printf("Error: Cannot create file - %v\n", err)
+                return
             }
         }
     } else {
         file, err = os.Create(filename)
         if err != nil {
-            panic(err)
+            fmt.Printf("Error: Cannot create file - %v\n", err)
+            return
         }
     }
     defer file.Close()
 
-    resp, err := http.Head(url)
+    // Kiểm tra kết nối mạng và lấy thông tin file
+    client := &http.Client{Timeout: 10 * time.Second}
+    resp, err := client.Head(urlStr)
     if err != nil {
-        panic(err)
+        fmt.Printf("Error: Network error - %v\n", err)
+        return
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+        fmt.Printf("Error: Server returned status %d\n", resp.StatusCode)
+        return
     }
 
     total := resp.ContentLength
+    if total <= 0 {
+        fmt.Printf("Error: Cannot determine file size\n")
+        return
+    }
+
     if *resume && currentSize > 0 {
-        fmt.Printf("Resuming download of %s (%d bytes remaining) with %d threads\n", filename, total-currentSize, *threads)
+        fmt.Printf("Resuming download of %s (%d bytes remaining) with %d threads\n\n", filename, total-currentSize, *threads)
     } else {
-        fmt.Printf("Downloading %s (%d bytes) with %d threads\n", filename, total, *threads)
+        fmt.Printf("Downloading %s (%d bytes) with %d threads\n\n", filename, total, *threads)
     }
 
     partSize := total / int64(*threads)
     var wg sync.WaitGroup
+    var errorOccurred atomic.Bool
+    errorChan := make(chan error, *threads)
     
     atomic.StoreInt64(&downloaded, currentSize)
 
@@ -100,24 +130,39 @@ func main() {
     defer close(updateChan)
     
     // Goroutine duy nhất để in progress bar
+    done := make(chan bool)
     go func() {
         var lastCurrent int64 = currentSize
         var lastUpdate time.Time
         
-        for current := range updateChan {
-            now := time.Now()
-            // Giới hạn tần suất in - tối đa 10 lần/giây
-            if now.Sub(lastUpdate) < 100*time.Millisecond && current < total {
-                continue
+        for {
+            select {
+            case current, ok := <-updateChan:
+                if !ok {
+                    // In lần cuối khi hoàn thành
+                    printProgress(lastCurrent, total, startTime, filename)
+                    fmt.Println()
+                    return
+                }
+                
+                if errorOccurred.Load() {
+                    return
+                }
+                
+                now := time.Now()
+                if now.Sub(lastUpdate) < 100*time.Millisecond && current < total {
+                    continue
+                }
+                lastUpdate = now
+                lastCurrent = current
+                printProgress(current, total, startTime, filename)
+            case <-done:
+                // In lần cuối khi hoàn thành
+                printProgress(lastCurrent, total, startTime, filename)
+                fmt.Println()
+                return
             }
-            lastUpdate = now
-            lastCurrent = current
-            printProgress(current, total, startTime, filename)
         }
-        
-        // In lần cuối khi hoàn thành
-        printProgress(lastCurrent, total, startTime, filename)
-        fmt.Println()
     }()
 
     for i := 0; i < *threads; i++ {
@@ -125,28 +170,60 @@ func main() {
         go func(i int) {
             defer wg.Done()
 
+            if errorOccurred.Load() {
+                return
+            }
+
             from := int64(i) * partSize + currentSize
             to := from + partSize - 1
             if i == *threads-1 {
                 to = total - 1
             }
 
-            req, _ := http.NewRequest("GET", url, nil)
+            req, err := http.NewRequest("GET", urlStr, nil)
+            if err != nil {
+                errorChan <- fmt.Errorf("Error creating request: %v", err)
+                errorOccurred.Store(true)
+                return
+            }
+            
             req.Header.Set("Range", "bytes="+strconv.FormatInt(from, 10)+"-"+strconv.FormatInt(to, 10))
-            client := &http.Client{}
+            
+            // Client với timeout
+            client := &http.Client{
+                Timeout: 30 * time.Second,
+            }
+            
             resp, err := client.Do(req)
             if err != nil {
-                panic(err)
+                errorChan <- fmt.Errorf("Network error: %v", err)
+                errorOccurred.Store(true)
+                return
             }
             defer resp.Body.Close()
+
+            if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+                errorChan <- fmt.Errorf("Server error: %d", resp.StatusCode)
+                errorOccurred.Store(true)
+                return
+            }
 
             buf := make([]byte, 32*1024)
             pos := from
             for {
+                if errorOccurred.Load() {
+                    return
+                }
+                
                 n, err := resp.Body.Read(buf)
                 if n > 0 {
                     file.Seek(pos, 0)
-                    file.Write(buf[:n])
+                    _, writeErr := file.Write(buf[:n])
+                    if writeErr != nil {
+                        errorChan <- fmt.Errorf("Error writing to file: %v", writeErr)
+                        errorOccurred.Store(true)
+                        return
+                    }
 
                     newDownloaded := atomic.AddInt64(&downloaded, int64(n))
                     select {
@@ -159,16 +236,36 @@ func main() {
                     if err == io.EOF {
                         break
                     } else {
-                        panic(err)
+                        errorChan <- fmt.Errorf("Error reading response: %v", err)
+                        errorOccurred.Store(true)
+                        return
                     }
                 }
             }
         }(i)
     }
 
-    wg.Wait()
-    time.Sleep(200 * time.Millisecond)
-    fmt.Printf("Download complete!\n")
+    // Goroutine để xử lý lỗi
+    go func() {
+        wg.Wait()
+        close(errorChan)
+        done <- true
+    }()
+
+    // Kiểm tra lỗi
+    hasError := false
+    for err := range errorChan {
+        if err != nil {
+            fmt.Printf("\n%s\n", err)
+            hasError = true
+        }
+    }
+
+    if !hasError {
+        // Đợi một chút để đảm bảo in lần cuối
+        time.Sleep(300 * time.Millisecond)
+        fmt.Printf("Download complete!\n")
+    }
 }
 
 func formatBytes(bytes int64) string {
@@ -222,6 +319,27 @@ func truncateFilename(filename string, maxWidth int) string {
     return filename[:head] + "..." + filename[len(filename)-tail:]
 }
 
+func scrollFilename(filename string, maxWidth int) string {
+    if len(filename) <= maxWidth {
+        return filename
+    }
+    
+    now := time.Now()
+    if now.Sub(lastScroll) > 500*time.Millisecond {
+        scrollOffset = (scrollOffset + 1) % (len(filename) + 3) // +3 để tạo độ trễ
+        lastScroll = now
+    }
+    
+    // Tạo hiệu ứng trượt từ từ
+    var result strings.Builder
+    for i := 0; i < maxWidth; i++ {
+        idx := (scrollOffset + i) % len(filename)
+        result.WriteByte(filename[idx])
+    }
+    
+    return result.String()
+}
+
 func printProgress(current, total int64, startTime time.Time, filename string) {
     printMu.Lock()
     defer printMu.Unlock()
@@ -240,7 +358,6 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
     }
     atomic.StoreInt32(&lastPercent, int32(percent))
 
-    // Tính toán tốc độ và thời gian còn lại
     elapsed := time.Since(startTime).Seconds()
     var speed float64
     if elapsed > 0 {
@@ -250,20 +367,18 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
     var remaining string
     if speed > 0 && current < total {
         remainingSeconds := int((float64(total) - float64(current)) / speed)
-        remaining = formatTime(remainingSeconds)
+        if remainingSeconds < 0 {
+            remaining = "unknown"
+        } else {
+            remaining = formatTime(remainingSeconds)
+        }
     } else {
         remaining = "unknown"
     }
 
-    // Tính toán kích thước các phần tử
     baseFilename := filepath.Base(filename)
-    
-    // Kích thước tối thiểu cho progress bar
     minBarWidth := 10
     
-    // Tính toán chiều rộng khả dụng cho progress bar
-    // Định dạng: "filename XX%[bar] X.XXM XXXB/s eta Xs"
-    // Ước lượng kích thước các phần cố định
     fixedPartsWidth := len(fmt.Sprintf(" %3d%%[", percent)) + 
         len(fmt.Sprintf("] %s %s/s eta %s", 
             formatBytes(current), 
@@ -272,7 +387,6 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
     
     availableWidth := terminalWidth - fixedPartsWidth
     
-    // Giới hạn chiều rộng tên file tối đa 30 ký tự
     maxFilenameWidth := 30
     if availableWidth < maxFilenameWidth + minBarWidth {
         maxFilenameWidth = availableWidth - minBarWidth
@@ -281,16 +395,14 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
         }
     }
     
-    // Xử lý tên file
-    displayName := truncateFilename(baseFilename, maxFilenameWidth)
+    // Sử dụng scrollFilename thay vì truncateFilename
+    displayName := scrollFilename(baseFilename, maxFilenameWidth)
     
-    // Tính toán chiều rộng progress bar thực tế
     barWidth := availableWidth - len(displayName)
     if barWidth < minBarWidth {
         barWidth = minBarWidth
     }
     
-    // Tạo progress bar
     filled := percent * barWidth / 100
     if filled > barWidth {
         filled = barWidth
@@ -298,14 +410,14 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
 
     var bar string
     if filled == barWidth {
-        bar = stringRepeat("=", filled)
+        bar = strings.Repeat("=", filled)
     } else if filled > 0 {
-        bar = stringRepeat("=", filled) + ">" + stringRepeat(" ", barWidth-filled-1)
+        bar = strings.Repeat("=", filled) + ">" + strings.Repeat(" ", barWidth-filled-1)
     } else {
-        bar = stringRepeat(" ", barWidth)
+        bar = strings.Repeat(" ", barWidth)
     }
 
-    // In progress bar
+    // In progress bar với khoảng cách rõ ràng
     fmt.Printf("\r%s %3d%%[%s] %s %s/s eta %s",
         displayName,
         percent,
@@ -313,15 +425,4 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
         formatBytes(current),
         formatSpeed(int64(speed)),
         remaining)
-}
-
-func stringRepeat(s string, count int) string {
-    if count <= 0 {
-        return ""
-    }
-    res := ""
-    for i := 0; i < count; i++ {
-        res += s
-    }
-    return res
 }
