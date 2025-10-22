@@ -25,13 +25,43 @@ var (
 )
 
 func main() {
-    // Đọc biến môi trường
-    envThreads := getEnvInt("THR", 2)
-    binName := getEnvString("FILE_BIN", "dow")
+    // Lấy tên file binary
+    binName := filepath.Base(os.Args[0])
 
     resume := flag.Bool("c", false, "Resume download if possible")
-    threads := flag.Int("th", envThreads, fmt.Sprintf("Number of threads to use (default %d from THR env var)", envThreads))
+    resumeLong := flag.Bool("continue", false, "Resume download if possible")
+    threads := flag.Int("th", 2, "Number of threads to use")
+    threadsLong := flag.Int("threads", 2, "Number of threads to use")
+    help := flag.Bool("h", false, "Show help")
+    helpLong := flag.Bool("help", false, "Show help")
+    
+    flag.Usage = func() {
+        fmt.Printf("Usage: %s [-c] [-th N] <filepath> <URL>\n\n", binName)
+        fmt.Printf("Options:\n")
+        fmt.Printf("  -c, --continue\tResume download if file exists\n")
+        fmt.Printf("  -th, --threads N\tNumber of threads to use (default: 2)\n")
+        fmt.Printf("  -h, --help\t\tShow this help message\n\n")
+        fmt.Printf("Examples:\n")
+        fmt.Printf("  %s https://example.com/file.zip\n", binName)
+        fmt.Printf("  %s -c -th 4 /path/to/save/file.zip https://example.com/file.zip\n", binName)
+        fmt.Printf("  %s --continue --threads 8 /path/to/save/file.zip https://example.com/file.zip\n", binName)
+    }
+
     flag.Parse()
+
+    // Xử lý help
+    if *help || *helpLong {
+        flag.Usage()
+        return
+    }
+
+    // Kết hợp các flag dài và ngắn
+    if *resumeLong {
+        *resume = true
+    }
+    if *threadsLong != 2 { // Nếu --threads được đặt giá trị khác mặc định
+        *threads = *threadsLong
+    }
 
     // Lấy kích thước terminal
     width, _, err := term.GetSize(int(os.Stdout.Fd()))
@@ -51,10 +81,7 @@ func main() {
         filename = flag.Arg(0)
         urlStr = flag.Arg(1)
     } else {
-        fmt.Printf("Usage: %s [-c] [-th N] <filepath> <URL>\n", binName)
-        fmt.Printf("Environment variables:\n")
-        fmt.Printf("  THR       Number of threads (default: %d)\n", envThreads)
-        fmt.Printf("  FILE_BIN  Binary name (default: %s)\n", binName)
+        flag.Usage()
         return
     }
 
@@ -282,24 +309,6 @@ func main() {
         time.Sleep(300 * time.Millisecond)
         fmt.Printf("Download complete!\n")
     }
-}
-
-// Hàm đọc biến môi trường số nguyên
-func getEnvInt(key string, defaultValue int) int {
-    if value, exists := os.LookupEnv(key); exists {
-        if intValue, err := strconv.Atoi(value); err == nil && intValue > 0 {
-            return intValue
-        }
-    }
-    return defaultValue
-}
-
-// Hàm đọc biến môi trường chuỗi
-func getEnvString(key string, defaultValue string) string {
-    if value, exists := os.LookupEnv(key); exists {
-        return value
-    }
-    return defaultValue
 }
 
 // Hàm tạo tên file duy nhất giống wget
