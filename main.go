@@ -26,30 +26,23 @@ var (
 
 func main() {
 	binName := filepath.Base(os.Args[0])
-
 	resume := flag.Bool("c", false, "Resume download if possible")
 	resumeLong := flag.Bool("continue", false, "Resume download if possible")
-	threads := flag.Int("th", 2, "Number of threads to use")
-	threadsLong := flag.Int("threads", 2, "Number of threads to use")
 	
 	flag.Usage = func() {
-		fmt.Printf("Usage: %s [-c] [-th N] <filepath> <URL>\n\n", binName)
+		fmt.Printf("Usage: %s [-c] <filepath> <URL>\n\n", binName)
 		fmt.Printf("Options:\n")
-		fmt.Printf("  -c, --continue\tResume download if file exists\n")
-		fmt.Printf("  -th, --threads N\tNumber of threads to use (default: 2)\n\n")
+		fmt.Printf("  -c, --continue\tResume download if file exists\n\n")
 		fmt.Printf("Examples:\n")
 		fmt.Printf("  %s https://example.com/file.zip\n", binName)
-		fmt.Printf("  %s -c -th 4 /path/to/save/file.zip https://example.com/file.zip\n", binName)
-		fmt.Printf("  %s --continue --threads 8 /path/to/save/file.zip https://example.com/file.zip\n", binName)
+		fmt.Printf("  %s -c /path/to/save/file.zip https://example.com/file.zip\n", binName)
+		fmt.Printf("  %s --continue /path/to/save/file.zip https://example.com/file.zip\n", binName)
 	}
 
 	flag.Parse()
 
 	if *resumeLong {
 		*resume = true
-	}
-	if *threadsLong != 2 {
-		*threads = *threadsLong
 	}
 
 	width, _, err := term.GetSize(int(os.Stdout.Fd()))
@@ -59,8 +52,7 @@ func main() {
 		terminalWidth = 80
 	}
 
-	var filename string
-	var urlStr string
+	var filename, urlStr string
 
 	if flag.NArg() == 1 {
 		urlStr = flag.Arg(0)
@@ -140,25 +132,21 @@ func main() {
 	}
 
 	if flag.NArg() >= 2 {
-		fmt.Printf("Downloading %s (Save in %s) (%d bytes) with %d threads\n\n", 
-			filepath.Base(urlStr), filename, total, *threads)
+		fmt.Printf("Downloading %s (Save in %s) (%d bytes)\n\n", filepath.Base(urlStr), filename, total)
 	} else {
 		if *resume && currentSize > 0 {
-			fmt.Printf("Resuming download of %s (%d bytes remaining) with %d threads\n\n", 
-				filename, total-currentSize, *threads)
+			fmt.Printf("Resuming download of %s (%d bytes remaining)\n\n", filename, total-currentSize)
 		} else {
-			fmt.Printf("Downloading %s (%d bytes) with %d threads\n\n", 
-				filename, total, *threads)
+			fmt.Printf("Downloading %s (%d bytes)\n\n", filename, total)
 		}
 	}
 
-	partSize := total / int64(*threads)
+	partSize := total / 2
 	var wg sync.WaitGroup
 	var errorOccurred atomic.Bool
-	errorChan := make(chan error, *threads)
+	errorChan := make(chan error, 2)
 	
 	atomic.StoreInt64(&downloaded, currentSize)
-
 	updateChan := make(chan int64, 1000)
 	defer close(updateChan)
 	
@@ -175,11 +163,9 @@ func main() {
 					fmt.Println()
 					return
 				}
-				
 				if errorOccurred.Load() {
 					return
 				}
-				
 				now := time.Now()
 				if now.Sub(lastUpdate) < 100*time.Millisecond && current < total {
 					continue
@@ -195,24 +181,22 @@ func main() {
 		}
 	}()
 
-	for i := 0; i < *threads; i++ {
+	for i := 0; i < 2; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-
 			if errorOccurred.Load() {
 				return
 			}
 
-			from := int64(i) * partSize + currentSize
+			from := int64(i)*partSize + currentSize
 			to := from + partSize - 1
-			if i == *threads-1 {
+			if i == 1 {
 				to = total - 1
 			}
 
 			req, _ := http.NewRequest("GET", urlStr, nil)
 			req.Header.Set("Range", "bytes="+strconv.FormatInt(from, 10)+"-"+strconv.FormatInt(to, 10))
-			
 			client := &http.Client{Timeout: 30 * time.Second}
 			resp, err := client.Do(req)
 			if err != nil {
@@ -234,12 +218,10 @@ func main() {
 				if errorOccurred.Load() {
 					return
 				}
-				
 				n, err := resp.Body.Read(buf)
 				if n > 0 {
 					file.Seek(pos, 0)
 					file.Write(buf[:n])
-
 					newDownloaded := atomic.AddInt64(&downloaded, int64(n))
 					select {
 					case updateChan <- newDownloaded:
@@ -284,10 +266,8 @@ func getUniqueFilename(filename string) string {
 	if _, err := os.Stat(filename); os.IsNotExist(err) {
 		return filename
 	}
-
 	ext := filepath.Ext(filename)
 	base := strings.TrimSuffix(filename, ext)
-	
 	counter := 1
 	for {
 		newFilename := fmt.Sprintf("%s.%d%s", base, counter, ext)
@@ -340,14 +320,11 @@ func truncateFilename(filename string, maxWidth int) string {
 	if len(filename) <= maxWidth {
 		return filename
 	}
-	
 	if maxWidth < 8 {
 		return filename[:maxWidth]
 	}
-	
 	head := (maxWidth - 3) / 2
 	tail := maxWidth - 3 - head
-	
 	return filename[:head] + "..." + filename[len(filename)-tail:]
 }
 
@@ -363,7 +340,6 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
 	if percent > 100 {
 		percent = 100
 	}
-	
 	if int32(percent) == atomic.LoadInt32(&lastPercent) && current < total {
 		return
 	}
@@ -391,15 +367,9 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
 
 	baseFilename := filepath.Base(filename)
 	minBarWidth := 10
-	
 	fixedPartsWidth := len(fmt.Sprintf(" %3d%%[", percent)) + 
-		len(fmt.Sprintf("] %s %s/s eta %s", 
-			formatBytes(current), 
-			formatSpeed(int64(speed)), 
-			remaining))
-	
+		len(fmt.Sprintf("] %s %s/s eta %s", formatBytes(current), formatSpeed(int64(speed)), remaining))
 	availableWidth := terminalWidth - fixedPartsWidth
-	
 	maxFilenameWidth := 30
 	if availableWidth < maxFilenameWidth + minBarWidth {
 		maxFilenameWidth = availableWidth - minBarWidth
@@ -407,14 +377,11 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
 			maxFilenameWidth = 8
 		}
 	}
-	
 	displayName := truncateFilename(baseFilename, maxFilenameWidth)
-	
 	barWidth := availableWidth - len(displayName)
 	if barWidth < minBarWidth {
 		barWidth = minBarWidth
 	}
-	
 	filled := percent * barWidth / 100
 	if filled > barWidth {
 		filled = barWidth
@@ -430,10 +397,5 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
 	}
 
 	fmt.Printf("\r%s %3d%%[%s] %s %s/s eta %s",
-		displayName,
-		percent,
-		bar,
-		formatBytes(current),
-		formatSpeed(int64(speed)),
-		remaining)
+		displayName, percent, bar, formatBytes(current), formatSpeed(int64(speed)), remaining)
 }
