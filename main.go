@@ -22,8 +22,6 @@ var (
     downloaded    int64
     printMu       sync.Mutex
     terminalWidth int
-    scrollOffset  int
-    lastScroll    time.Time
 )
 
 func main() {
@@ -63,6 +61,15 @@ func main() {
     dir := filepath.Dir(filename)
     if dir != "." {
         os.MkdirAll(dir, os.ModePerm)
+    }
+
+    // Xử lý tên file trùng (giống wget)
+    originalFilename := filename
+    if !*resume {
+        filename = getUniqueFilename(filename)
+        if filename != originalFilename {
+            fmt.Printf("File '%s' already exists, downloading as '%s'\n", originalFilename, filename)
+        }
     }
 
     var file *os.File
@@ -268,6 +275,28 @@ func main() {
     }
 }
 
+// Hàm tạo tên file duy nhất giống wget
+func getUniqueFilename(filename string) string {
+    if _, err := os.Stat(filename); os.IsNotExist(err) {
+        return filename
+    }
+
+    ext := filepath.Ext(filename)
+    base := strings.TrimSuffix(filename, ext)
+    
+    counter := 1
+    for {
+        newFilename := fmt.Sprintf("%s.%d%s", base, counter, ext)
+        if _, err := os.Stat(newFilename); os.IsNotExist(err) {
+            return newFilename
+        }
+        counter++
+        if counter > 1000 { // Giới hạn để tránh vòng lặp vô hạn
+            return filename
+        }
+    }
+}
+
 func formatBytes(bytes int64) string {
     if bytes < 1024 {
         return fmt.Sprintf("%dB", bytes)
@@ -292,7 +321,7 @@ func formatSpeed(bytes int64) string {
 
 func formatTime(seconds int) string {
     if seconds < 0 {
-        return "unknown"
+        return "0s"
     }
     if seconds < 60 {
         return fmt.Sprintf("%ds", seconds)
@@ -317,27 +346,6 @@ func truncateFilename(filename string, maxWidth int) string {
     tail := maxWidth - 3 - head
     
     return filename[:head] + "..." + filename[len(filename)-tail:]
-}
-
-func scrollFilename(filename string, maxWidth int) string {
-    if len(filename) <= maxWidth {
-        return filename
-    }
-    
-    now := time.Now()
-    if now.Sub(lastScroll) > 500*time.Millisecond {
-        scrollOffset = (scrollOffset + 1) % (len(filename) + 3) // +3 để tạo độ trễ
-        lastScroll = now
-    }
-    
-    // Tạo hiệu ứng trượt từ từ
-    var result strings.Builder
-    for i := 0; i < maxWidth; i++ {
-        idx := (scrollOffset + i) % len(filename)
-        result.WriteByte(filename[idx])
-    }
-    
-    return result.String()
 }
 
 func printProgress(current, total int64, startTime time.Time, filename string) {
@@ -365,15 +373,17 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
     }
 
     var remaining string
-    if speed > 0 && current < total {
+    if current >= total {
+        remaining = "0s"
+    } else if speed > 0 {
         remainingSeconds := int((float64(total) - float64(current)) / speed)
         if remainingSeconds < 0 {
-            remaining = "unknown"
+            remaining = "0s"
         } else {
             remaining = formatTime(remainingSeconds)
         }
     } else {
-        remaining = "unknown"
+        remaining = "0s"
     }
 
     baseFilename := filepath.Base(filename)
@@ -395,8 +405,8 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
         }
     }
     
-    // Sử dụng scrollFilename thay vì truncateFilename
-    displayName := scrollFilename(baseFilename, maxFilenameWidth)
+    // Sử dụng truncateFilename thay vì scrollFilename
+    displayName := truncateFilename(baseFilename, maxFilenameWidth)
     
     barWidth := availableWidth - len(displayName)
     if barWidth < minBarWidth {
