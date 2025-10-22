@@ -32,8 +32,6 @@ func main() {
     resumeLong := flag.Bool("continue", false, "Resume download if possible")
     threads := flag.Int("th", 2, "Number of threads to use")
     threadsLong := flag.Int("threads", 2, "Number of threads to use")
-    help := flag.Bool("h", false, "Show help")
-    helpLong := flag.Bool("help", false, "Show help")
     
     flag.Usage = func() {
         fmt.Printf("Usage: %s [-c] [-th N] <filepath> <URL>\n\n", binName)
@@ -48,12 +46,6 @@ func main() {
     }
 
     flag.Parse()
-
-    // Xử lý help
-    if *help || *helpLong {
-        flag.Usage()
-        return
-    }
 
     // Kết hợp các flag dài và ngắn
     if *resumeLong {
