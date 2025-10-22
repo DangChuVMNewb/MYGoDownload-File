@@ -120,10 +120,20 @@ func main() {
         return
     }
 
-    if *resume && currentSize > 0 {
-        fmt.Printf("Resuming download of %s (%d bytes remaining) with %d threads\n\n", filename, total-currentSize, *threads)
+    // Hiển thị thông tin download giống yêu cầu
+    if flag.NArg() >= 2 {
+        // Trường hợp có chỉ định tên file
+        fmt.Printf("Downloading %s (Save in %s) (%d bytes) with %d threads\n\n", 
+            filepath.Base(urlStr), filename, total, *threads)
     } else {
-        fmt.Printf("Downloading %s (%d bytes) with %d threads\n\n", filename, total, *threads)
+        // Trường hợp chỉ có URL
+        if *resume && currentSize > 0 {
+            fmt.Printf("Resuming download of %s (%d bytes remaining) with %d threads\n\n", 
+                filename, total-currentSize, *threads)
+        } else {
+            fmt.Printf("Downloading %s (%d bytes) with %d threads\n\n", 
+                filename, total, *threads)
+        }
     }
 
     partSize := total / int64(*threads)
@@ -405,7 +415,6 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
         }
     }
     
-    // Sử dụng truncateFilename thay vì scrollFilename
     displayName := truncateFilename(baseFilename, maxFilenameWidth)
     
     barWidth := availableWidth - len(displayName)
