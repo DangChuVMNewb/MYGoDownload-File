@@ -29,7 +29,6 @@ func main() {
     threads := flag.Int("th", 2, "Number of threads to use (default 2)")
     flag.Parse()
 
-    // Lấy kích thước terminal
     width, _, err := term.GetSize(int(os.Stdout.Fd()))
     if err == nil && width > 0 {
         terminalWidth = width
@@ -51,7 +50,6 @@ func main() {
         return
     }
 
-    // Kiểm tra URL hợp lệ
     _, err = url.ParseRequestURI(urlStr)
     if err != nil {
         fmt.Printf("Error: Invalid URL - %v\n", err)
@@ -63,7 +61,6 @@ func main() {
         os.MkdirAll(dir, os.ModePerm)
     }
 
-    // Xử lý tên file trùng (giống wget)
     originalFilename := filename
     if !*resume {
         filename = getUniqueFilename(filename)
@@ -100,7 +97,6 @@ func main() {
     }
     defer file.Close()
 
-    // Kiểm tra kết nối mạng và lấy thông tin file
     client := &http.Client{Timeout: 10 * time.Second}
     resp, err := client.Head(urlStr)
     if err != nil {
@@ -120,13 +116,10 @@ func main() {
         return
     }
 
-    // Hiển thị thông tin download giống yêu cầu
     if flag.NArg() >= 2 {
-        // Trường hợp có chỉ định tên file
         fmt.Printf("Downloading %s (Save in %s) (%d bytes) with %d threads\n\n", 
             filepath.Base(urlStr), filename, total, *threads)
     } else {
-        // Trường hợp chỉ có URL
         if *resume && currentSize > 0 {
             fmt.Printf("Resuming download of %s (%d bytes remaining) with %d threads\n\n", 
                 filename, total-currentSize, *threads)
@@ -146,7 +139,6 @@ func main() {
     updateChan := make(chan int64, 1000)
     defer close(updateChan)
     
-    // Goroutine duy nhất để in progress bar
     done := make(chan bool)
     go func() {
         var lastCurrent int64 = currentSize
