@@ -148,7 +148,6 @@ func main() {
             select {
             case current, ok := <-updateChan:
                 if !ok {
-                    // In lần cuối khi hoàn thành
                     printProgress(lastCurrent, total, startTime, filename)
                     fmt.Println()
                     return
@@ -166,7 +165,6 @@ func main() {
                 lastCurrent = current
                 printProgress(current, total, startTime, filename)
             case <-done:
-                // In lần cuối khi hoàn thành
                 printProgress(lastCurrent, total, startTime, filename)
                 fmt.Println()
                 return
@@ -198,7 +196,6 @@ func main() {
             
             req.Header.Set("Range", "bytes="+strconv.FormatInt(from, 10)+"-"+strconv.FormatInt(to, 10))
             
-            // Client với timeout
             client := &http.Client{
                 Timeout: 30 * time.Second,
             }
@@ -254,14 +251,12 @@ func main() {
         }(i)
     }
 
-    // Goroutine để xử lý lỗi
     go func() {
         wg.Wait()
         close(errorChan)
         done <- true
     }()
 
-    // Kiểm tra lỗi
     hasError := false
     for err := range errorChan {
         if err != nil {
@@ -271,13 +266,11 @@ func main() {
     }
 
     if !hasError {
-        // Đợi một chút để đảm bảo in lần cuối
         time.Sleep(300 * time.Millisecond)
         fmt.Printf("Download complete!\n")
     }
 }
 
-// Hàm tạo tên file duy nhất giống wget
 func getUniqueFilename(filename string) string {
     if _, err := os.Stat(filename); os.IsNotExist(err) {
         return filename
@@ -293,7 +286,7 @@ func getUniqueFilename(filename string) string {
             return newFilename
         }
         counter++
-        if counter > 1000 { // Giới hạn để tránh vòng lặp vô hạn
+        if counter > 1000 {
             return filename
         }
     }
@@ -343,7 +336,6 @@ func truncateFilename(filename string, maxWidth int) string {
         return filename[:maxWidth]
     }
     
-    // Cắt bớt và thêm "..." ở giữa
     head := (maxWidth - 3) / 2
     tail := maxWidth - 3 - head
     
@@ -428,7 +420,6 @@ func printProgress(current, total int64, startTime time.Time, filename string) {
         bar = strings.Repeat(" ", barWidth)
     }
 
-    // In progress bar với khoảng cách rõ ràng
     fmt.Printf("\r%s %3d%%[%s] %s %s/s eta %s",
         displayName,
         percent,
