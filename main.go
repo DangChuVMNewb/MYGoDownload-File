@@ -25,10 +25,15 @@ var (
 )
 
 func main() {
+    // Đọc biến môi trường
+    envThreads := getEnvInt("THR", 2)
+    binName := getEnvString("FILE_BIN", "dow")
+
     resume := flag.Bool("c", false, "Resume download if possible")
-    threads := flag.Int("th", 2, "Number of threads to use (default 2)")
+    threads := flag.Int("th", envThreads, fmt.Sprintf("Number of threads to use (default %d from THR env var)", envThreads))
     flag.Parse()
 
+    // Lấy kích thước terminal
     width, _, err := term.GetSize(int(os.Stdout.Fd()))
     if err == nil && width > 0 {
         terminalWidth = width
@@ -46,10 +51,14 @@ func main() {
         filename = flag.Arg(0)
         urlStr = flag.Arg(1)
     } else {
-        fmt.Println("Usage: dow [-c] [-th N] <filepath> <URL>")
+        fmt.Printf("Usage: %s [-c] [-th N] <filepath> <URL>\n", binName)
+        fmt.Printf("Environment variables:\n")
+        fmt.Printf("  THR       Number of threads (default: %d)\n", envThreads)
+        fmt.Printf("  FILE_BIN  Binary name (default: %s)\n", binName)
         return
     }
 
+    // Kiểm tra URL hợp lệ
     _, err = url.ParseRequestURI(urlStr)
     if err != nil {
         fmt.Printf("Error: Invalid URL - %v\n", err)
@@ -61,6 +70,7 @@ func main() {
         os.MkdirAll(dir, os.ModePerm)
     }
 
+    // Xử lý tên file trùng (giống wget)
     originalFilename := filename
     if !*resume {
         filename = getUniqueFilename(filename)
@@ -97,6 +107,7 @@ func main() {
     }
     defer file.Close()
 
+    // Kiểm tra kết nối mạng và lấy thông tin file
     client := &http.Client{Timeout: 10 * time.Second}
     resp, err := client.Head(urlStr)
     if err != nil {
@@ -116,6 +127,7 @@ func main() {
         return
     }
 
+    // Hiển thị thông tin download
     if flag.NArg() >= 2 {
         fmt.Printf("Downloading %s (Save in %s) (%d bytes) with %d threads\n\n", 
             filepath.Base(urlStr), filename, total, *threads)
@@ -139,6 +151,7 @@ func main() {
     updateChan := make(chan int64, 1000)
     defer close(updateChan)
     
+    // Goroutine duy nhất để in progress bar
     done := make(chan bool)
     go func() {
         var lastCurrent int64 = currentSize
@@ -271,6 +284,25 @@ func main() {
     }
 }
 
+// Hàm đọc biến môi trường số nguyên
+func getEnvInt(key string, defaultValue int) int {
+    if value, exists := os.LookupEnv(key); exists {
+        if intValue, err := strconv.Atoi(value); err == nil && intValue > 0 {
+            return intValue
+        }
+    }
+    return defaultValue
+}
+
+// Hàm đọc biến môi trường chuỗi
+func getEnvString(key string, defaultValue string) string {
+    if value, exists := os.LookupEnv(key); exists {
+        return value
+    }
+    return defaultValue
+}
+
+// Hàm tạo tên file duy nhất giống wget
 func getUniqueFilename(filename string) string {
     if _, err := os.Stat(filename); os.IsNotExist(err) {
         return filename
