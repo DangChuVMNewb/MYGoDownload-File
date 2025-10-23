@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
+	"golang.org/x/term"
 	"io"
 	"net/http"
 	"net/url"
@@ -13,101 +15,124 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"golang.org/x/term"
 )
 
 var (
-	lastPercent   int32 = -1
-	startTime           = time.Now()
-	downloaded    int64
-	printMu       sync.Mutex
+	startTime     time.Time
 	terminalWidth int
+	isTerminal    bool
 )
 
 func main() {
 	binName := filepath.Base(os.Args[0])
 	resume := flag.Bool("c", false, "Resume download if possible")
 	resumeLong := flag.Bool("continue", false, "Resume download if possible")
-	
+	urlListFile := flag.String("l", "", "Read URLs from file (one per line)")
 	flag.Usage = func() {
-		fmt.Printf("Usage: %s [-c] <filepath> <URL>\n\n", binName)
+		fmt.Printf("Usage: %s [options] <URL1> [URL2 ...]\n\n", binName)
 		fmt.Printf("Options:\n")
-		fmt.Printf("  -c, --continue\tResume download if file exists\n\n")
+		fmt.Printf("  -c, --continue\tResume download if file exists\n")
+		fmt.Printf("  -l FILE\t\tRead list of URLs from FILE\n\n")
 		fmt.Printf("Examples:\n")
 		fmt.Printf("  %s https://example.com/file.zip\n", binName)
-		fmt.Printf("  %s -c /path/to/save/file.zip https://example.com/file.zip\n", binName)
-		fmt.Printf("  %s --continue /path/to/save/file.zip https://example.com/file.zip\n", binName)
+		fmt.Printf("  %s -c https://a.com/file1.zip https://b.com/file2.zip\n", binName)
+		fmt.Printf("  %s -l urls.txt\n", binName)
 	}
-
 	flag.Parse()
-
 	if *resumeLong {
 		*resume = true
 	}
 
-	width, _, err := term.GetSize(int(os.Stdout.Fd()))
-	if err == nil && width > 0 {
-		terminalWidth = width
-	} else {
-		terminalWidth = 80
+	// Detect terminal
+	isTerminal = term.IsTerminal(int(os.Stdout.Fd()))
+	width := 80
+	if isTerminal {
+		if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
+			width = w
+		}
 	}
+	terminalWidth = width
 
-	var filename, urlStr string
-
-	if flag.NArg() == 1 {
-		urlStr = flag.Arg(0)
-		filename = filepath.Base(urlStr)
-	} else if flag.NArg() >= 2 {
-		filename = flag.Arg(0)
-		urlStr = flag.Arg(1)
-	} else {
+	// Build list of URLs to download
+	urls := []string{}
+	if *urlListFile != "" {
+		f, err := os.Open(*urlListFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Cannot open url list file: %v\n", err)
+			os.Exit(1)
+		}
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line != "" && !strings.HasPrefix(line, "#") {
+				urls = append(urls, line)
+			}
+		}
+		f.Close()
+		if err := scanner.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading urls file: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	urls = append(urls, flag.Args()...)
+	if len(urls) == 0 {
 		flag.Usage()
-		return
+		os.Exit(1)
 	}
 
-	_, err = url.ParseRequestURI(urlStr)
+	// Download each file concurrently
+	var wg sync.WaitGroup
+	for _, urlStr := range urls {
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+			err := downloadFile(u, *resume)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "\nError downloading %s: %v\n", u, err)
+			}
+		}(urlStr)
+	}
+	wg.Wait()
+}
+
+// downloadFile performs download of a single file
+func downloadFile(urlStr string, resume bool) error {
+	parsed, err := url.ParseRequestURI(urlStr)
 	if err != nil {
-		fmt.Printf("Error: Invalid URL - %v\n", err)
-		return
+		return fmt.Errorf("invalid URL: %v", err)
 	}
-
+	filename := filepath.Base(parsed.Path)
+	if filename == "" || filename == "/" || filename == "." {
+		filename = "downloaded.file"
+	}
+	// If file exists, and not resume, get unique name
+	if !resume {
+		filename = getUniqueFilename(filename)
+	}
 	dir := filepath.Dir(filename)
 	if dir != "." {
 		os.MkdirAll(dir, os.ModePerm)
 	}
-
-	originalFilename := filename
-	if !*resume {
-		filename = getUniqueFilename(filename)
-		if filename != originalFilename {
-			fmt.Printf("File '%s' already exists, downloading as '%s'\n", originalFilename, filename)
-		}
-	}
-
 	var file *os.File
 	var currentSize int64 = 0
-
-	if *resume {
-		fileInfo, err := os.Stat(filename)
+	if resume {
+		info, err := os.Stat(filename)
 		if err == nil {
 			file, err = os.OpenFile(filename, os.O_RDWR, 0644)
 			if err != nil {
-				fmt.Printf("Error: Cannot open file - %v\n", err)
-				return
+				return fmt.Errorf("cannot open file: %v", err)
 			}
-			currentSize = fileInfo.Size()
+			currentSize = info.Size()
 		} else {
 			file, err = os.Create(filename)
 			if err != nil {
-				fmt.Printf("Error: Cannot create file - %v\n", err)
-				return
+				return fmt.Errorf("cannot create file: %v", err)
 			}
 		}
 	} else {
 		file, err = os.Create(filename)
 		if err != nil {
-			fmt.Printf("Error: Cannot create file - %v\n", err)
-			return
+			return fmt.Errorf("cannot create file: %v", err)
 		}
 	}
 	defer file.Close()
@@ -115,52 +140,46 @@ func main() {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Head(urlStr)
 	if err != nil {
-		fmt.Printf("Error: Network error - %v\n", err)
-		return
+		return fmt.Errorf("network error: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		fmt.Printf("Error: Server returned status %d\n", resp.StatusCode)
-		return
+		return fmt.Errorf("server returned status %d", resp.StatusCode)
 	}
-
 	total := resp.ContentLength
 	if total <= 0 {
-		fmt.Printf("Error: Cannot determine file size\n")
-		return
+		return fmt.Errorf("cannot determine file size")
 	}
-
-	if flag.NArg() >= 2 {
-		fmt.Printf("Downloading %s (Save in %s) (%d bytes)\n\n", filepath.Base(urlStr), filename, total)
-	} else {
-		if *resume && currentSize > 0 {
-			fmt.Printf("Resuming download of %s (%d bytes remaining)\n\n", filename, total-currentSize)
+	if isTerminal {
+		if resume && currentSize > 0 {
+			fmt.Printf("[*] Resuming %s (%d/%d bytes)\n", filename, currentSize, total)
 		} else {
-			fmt.Printf("Downloading %s (%d bytes)\n\n", filename, total)
+			fmt.Printf("[*] Downloading %s (%d bytes)\n", filename, total)
 		}
+	} else {
+		fmt.Printf("START %s %s %d\n", filename, urlStr, total)
 	}
 
 	partSize := total / 2
 	var wg sync.WaitGroup
+	var downloaded int64 = currentSize
 	var errorOccurred atomic.Bool
 	errorChan := make(chan error, 2)
-	
-	atomic.StoreInt64(&downloaded, currentSize)
 	updateChan := make(chan int64, 1000)
-	defer close(updateChan)
-	
 	done := make(chan bool)
+	startTime = time.Now()
 	go func() {
 		var lastCurrent int64 = currentSize
 		var lastUpdate time.Time
-		
 		for {
 			select {
 			case current, ok := <-updateChan:
 				if !ok {
-					printProgress(lastCurrent, total, startTime, filename)
-					fmt.Println()
+					printProgress(filename, lastCurrent, total, startTime, true)
+					if isTerminal {
+						fmt.Println()
+					}
 					return
 				}
 				if errorOccurred.Load() {
@@ -172,10 +191,12 @@ func main() {
 				}
 				lastUpdate = now
 				lastCurrent = current
-				printProgress(current, total, startTime, filename)
+				printProgress(filename, current, total, startTime, false)
 			case <-done:
-				printProgress(lastCurrent, total, startTime, filename)
-				fmt.Println()
+				printProgress(filename, lastCurrent, total, startTime, true)
+				if isTerminal {
+					fmt.Println()
+				}
 				return
 			}
 		}
@@ -188,13 +209,11 @@ func main() {
 			if errorOccurred.Load() {
 				return
 			}
-
 			from := int64(i)*partSize + currentSize
 			to := from + partSize - 1
 			if i == 1 {
 				to = total - 1
 			}
-
 			req, _ := http.NewRequest("GET", urlStr, nil)
 			req.Header.Set("Range", "bytes="+strconv.FormatInt(from, 10)+"-"+strconv.FormatInt(to, 10))
 			client := &http.Client{Timeout: 30 * time.Second}
@@ -205,13 +224,11 @@ func main() {
 				return
 			}
 			defer resp.Body.Close()
-
 			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 				errorChan <- fmt.Errorf("Server error: %d", resp.StatusCode)
 				errorOccurred.Store(true)
 				return
 			}
-
 			buf := make([]byte, 32*1024)
 			pos := from
 			for {
@@ -241,27 +258,30 @@ func main() {
 			}
 		}(i)
 	}
-
 	go func() {
 		wg.Wait()
 		close(errorChan)
 		done <- true
 	}()
-
 	hasError := false
 	for err := range errorChan {
 		if err != nil {
-			fmt.Printf("\n%s\n", err)
+			fmt.Fprintf(os.Stderr, "\n%s\n", err)
 			hasError = true
 		}
 	}
-
 	if !hasError {
 		time.Sleep(300 * time.Millisecond)
-		fmt.Printf("Download complete!\n")
+		if isTerminal {
+			fmt.Printf("[✓] %s - Download complete!\n", filename)
+		} else {
+			fmt.Printf("DONE %s\n", filename)
+		}
 	}
+	return nil
 }
 
+// getUniqueFilename returns a filename that does not exist by appending .N if needed
 func getUniqueFilename(filename string) string {
 	if _, err := os.Stat(filename); os.IsNotExist(err) {
 		return filename
@@ -328,74 +348,67 @@ func truncateFilename(filename string, maxWidth int) string {
 	return filename[:head] + "..." + filename[len(filename)-tail:]
 }
 
-func printProgress(current, total int64, startTime time.Time, filename string) {
-	printMu.Lock()
-	defer printMu.Unlock()
-
+// printProgress prints progress bar for terminal or log line for non-terminal
+func printProgress(filename string, current, total int64, startTime time.Time, flush bool) {
 	if total <= 0 {
 		return
 	}
-
 	percent := int(float64(current) / float64(total) * 100)
 	if percent > 100 {
 		percent = 100
 	}
-	if int32(percent) == atomic.LoadInt32(&lastPercent) && current < total {
-		return
-	}
-	atomic.StoreInt32(&lastPercent, int32(percent))
-
 	elapsed := time.Since(startTime).Seconds()
 	var speed float64
 	if elapsed > 0 {
 		speed = float64(current) / elapsed
 	}
-
 	var remaining string
 	if current >= total {
 		remaining = "0s"
 	} else if speed > 0 {
 		remainingSeconds := int((float64(total) - float64(current)) / speed)
-		if remainingSeconds < 0 {
-			remaining = "0s"
-		} else {
-			remaining = formatTime(remainingSeconds)
-		}
+		remaining = formatTime(remainingSeconds)
 	} else {
 		remaining = "0s"
 	}
-
 	baseFilename := filepath.Base(filename)
-	minBarWidth := 10
-	fixedPartsWidth := len(fmt.Sprintf(" %3d%%[", percent)) + 
-		len(fmt.Sprintf("] %s %s/s eta %s", formatBytes(current), formatSpeed(int64(speed)), remaining))
-	availableWidth := terminalWidth - fixedPartsWidth
-	maxFilenameWidth := 30
-	if availableWidth < maxFilenameWidth + minBarWidth {
-		maxFilenameWidth = availableWidth - minBarWidth
-		if maxFilenameWidth < 8 {
-			maxFilenameWidth = 8
+	if isTerminal {
+		// Pretty progress bar
+		minBarWidth := 10
+		fixedWidth := len(fmt.Sprintf(" %3d%%[", percent)) +
+			len(fmt.Sprintf("] %s %s/s eta %s", formatBytes(current), formatSpeed(int64(speed)), remaining))
+		availWidth := terminalWidth - fixedWidth
+		maxFilenameWidth := 30
+		if availWidth < maxFilenameWidth+minBarWidth {
+			maxFilenameWidth = availWidth - minBarWidth
+			if maxFilenameWidth < 8 {
+				maxFilenameWidth = 8
+			}
 		}
-	}
-	displayName := truncateFilename(baseFilename, maxFilenameWidth)
-	barWidth := availableWidth - len(displayName)
-	if barWidth < minBarWidth {
-		barWidth = minBarWidth
-	}
-	filled := percent * barWidth / 100
-	if filled > barWidth {
-		filled = barWidth
-	}
-
-	var bar string
-	if filled == barWidth {
-		bar = strings.Repeat("=", filled)
-	} else if filled > 0 {
-		bar = strings.Repeat("=", filled) + ">" + strings.Repeat(" ", barWidth-filled-1)
+		displayName := truncateFilename(baseFilename, maxFilenameWidth)
+		barWidth := availWidth - len(displayName)
+		if barWidth < minBarWidth {
+			barWidth = minBarWidth
+		}
+		filled := percent * barWidth / 100
+		if filled > barWidth {
+			filled = barWidth
+		}
+		var bar string
+		if filled == barWidth {
+			bar = strings.Repeat("=", filled)
+		} else if filled > 0 {
+			bar = strings.Repeat("=", filled) + ">" + strings.Repeat(" ", barWidth-filled-1)
+		} else {
+			bar = strings.Repeat(" ", barWidth)
+		}
+		fmt.Printf("\r%s %3d%%[%s] %s %s/s eta %s",
+			displayName, percent, bar, formatBytes(current), formatSpeed(int64(speed)), remaining)
+		if flush && percent == 100 {
+			fmt.Printf("\n")
+		}
 	} else {
-		bar = strings.Repeat(" ", barWidth)
+		// Non-terminal: log line
+		fmt.Printf("PROGRESS %s %d/%d %d%% %s/s eta %s\n", baseFilename, current, total, percent, formatSpeed(int64(speed)), remaining)
 	}
-
-	fmt.Printf("\r%s %3d%%[%s] %s %s/s eta %s",
-		displayName, percent, bar, formatBytes(current), formatSpeed(int64(speed)), remaining)
 }
